@@ -2,8 +2,8 @@
 
 import asyncio
 
-from app.connection.manager import ConnectionManager
-from app.core.config import BINANCE_TRADES_STREAM
+from services.collector.app.connection.manager import ConnectionManager
+from services.collector.app.core.config import BINANCE_TRADES_STREAM
 
 
 async def main():

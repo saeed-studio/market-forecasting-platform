@@ -33,11 +33,3 @@ Redis-backed state store
 or Kafka compacted topic
 
 -----------------------------------------------------------------------
-## Decision 
-
-
-## Context
-
-
-## Consequences
-

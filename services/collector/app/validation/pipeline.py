@@ -1,9 +1,5 @@
 # services/collector/app/validation/pipeline.py
 
-from services.collector.app.validation.validators.trade_validator import (
-    TradeValidator,
-)
-
 from services.collector.app.validation.validators.timestamp_validator import (
     TimestampValidator,
 )
@@ -21,7 +17,6 @@ class ValidationPipeline:
     def __init__(self):
 
         self.validators = [
-            TradeValidator(),
             TimestampValidator(),
             DuplicateValidator(),
             SequenceValidator(),

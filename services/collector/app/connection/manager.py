@@ -187,12 +187,15 @@ class ConnectionManager:
 
         self.logger.info("Shutdown complete")
 
-    async def run(self) -> None:
-        """Main connection lifecycle loop.
+    async def listen(self):
+        """Async generator that yields messages from the WebSocket stream.
 
         Continuously attempts to connect and receive messages from the stream.
         On connection failure or error, automatically reconnects with exponential
-        backoff. Continues until the shutdown event is set.
+        backoff. Yields each message as it arrives.
+
+        Yields:
+            dict: Parsed JSON message from the stream.
         """
         # Start metrics reporter as a background task
         reporter_task = asyncio.create_task(self.metrics_reporter())
@@ -202,7 +205,40 @@ class ConnectionManager:
                 try:
                     await self.connect()
 
-                    await self.receive_loop()
+                    while not self.shutdown_event.is_set():
+                        try:
+                            message = await asyncio.wait_for(
+                                self.websocket.recv(),
+                                timeout=RECEIVE_TIMEOUT_SECONDS,
+                            )
+
+                            self.heartbeat.beat()
+
+                            try:
+                                parsed_message = json.loads(message)
+                                yield parsed_message
+
+                            except json.JSONDecodeError as exc:
+                                self.logger.error(f"EVENT=PAYLOAD_ERROR MESSAGE={exc}")
+                                continue
+
+                            self.metrics.increment_messages()
+
+                        except asyncio.TimeoutError:
+                            self.metrics.increment_timeouts()
+
+                            self.logger.warning("EVENT=RECEIVE_TIMEOUT")
+
+                            if self.heartbeat.is_stale():
+                                self.metrics.increment_stale_events()
+
+                                raise StaleConnectionError(
+                                    "No messages received within stale threshold."
+                                )
+
+                        except ConnectionClosed as exc:
+                            self.logger.warning(f"EVENT=CONNECTION_CLOSED ERROR={exc}")
+                            raise
 
                 except (
                     ConnectionClosed,
@@ -229,6 +265,16 @@ class ConnectionManager:
                 await reporter_task
             except asyncio.CancelledError:
                 pass
+
+    async def run(self) -> None:
+        """Main connection lifecycle loop.
+
+        Continuously attempts to connect and receive messages from the stream.
+        On connection failure or error, automatically reconnects with exponential
+        backoff. Continues until the shutdown event is set.
+        """
+        async for _ in self.listen():
+            pass
 
     # signal handlers are not implemented on windows platform,
     # so this method is commented out to avoid issues during development on windows

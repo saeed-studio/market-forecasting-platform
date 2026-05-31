@@ -31,12 +31,5 @@ class TradeValidator:
         if missing_fields:
             raise PayloadError(f"Missing required fields: {missing_fields}")
 
-        # these will be checked in validation pipeline, but we can check them here as well to fail fast
-        price = float(payload["p"])
-        quantity = float(payload["q"])
 
-        if price <= 0:
-            raise PayloadError(f"Invalid price: {price}")
-
-        if quantity <= 0:
-            raise PayloadError(f"Invalid quantity: {quantity}")
+# zero price and quantity events had been filtered out in trade consumer already

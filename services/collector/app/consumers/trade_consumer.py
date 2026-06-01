@@ -22,7 +22,7 @@ class TradeConsumer:
 
         # Skip zero-price or zero-quantity events to prevent crash on N/A execution types
         if price <= 0 or quantity <= 0:
-            print("non trade type payload", payload)
+            # print("non trade type payload", payload)
             return None
 
         TradeValidator.validate(payload)

@@ -54,3 +54,16 @@ adding critical logs on too many failures
 ### Lessons Learned
 Monitoring is a fundamental part of a good system 
 ----------------------------------
+## 2026-06-01
+
+### problem 
+Using file rotator with a new file each flush at storing raw data leads to a complete chaos 
+
+### Root couse 
+Storage strategi 
+
+### solution 
+Using data flush strategy with date partitioning. 
+
+### lesson learned 
+Every decision must consider having huge amout of data effects. 

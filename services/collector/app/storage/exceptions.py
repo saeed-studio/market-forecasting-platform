@@ -4,7 +4,3 @@ class StorageError(Exception):
 
 class FlushError(StorageError):
     pass
-
-
-class RotationError(StorageError):
-    pass

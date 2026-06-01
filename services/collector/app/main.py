@@ -15,8 +15,8 @@ from services.collector.app.storage.batcher import (
     EventBatcher,
 )
 
-from services.collector.app.storage.rotator import (
-    FileRotator,
+from services.collector.app.storage.partitioner import (
+    Partitioner,
 )
 
 from services.collector.app.storage.writer import (
@@ -36,18 +36,18 @@ async def main():
 
     queue = EventQueue(maxsize=10000)
 
-    batcher = EventBatcher(
-        batch_size=1000,
-        flush_interval=30,
-    )
-
-    rotator = FileRotator(
-        max_rows_per_file=100000,
+    partitioner = Partitioner(
+        base_path="data/raw",
+        stream_type="trades",
     )
 
     writer = StorageWriter(
-        base_path=("data/raw/trades/BTCUSDT"),
-        rotator=rotator,
+        partitioner=partitioner,
+    )
+
+    batcher = EventBatcher(
+        batch_size=1000,
+        flush_interval=60,
     )
 
     collector = CollectorService(
@@ -61,11 +61,15 @@ async def main():
     )
 
     asyncio.create_task(storage_consumer.run())
+    asyncio.create_task(storage_consumer.periodic_flush())
 
     connection = ConnectionManager(stream_url=BINANCE_TRADES_STREAM)
 
-    async for message in connection.listen():
-        await collector.process_message(message)
+    try:
+        async for message in connection.listen():
+            await collector.process_message(message)
+    finally:
+        await storage_consumer.stop()
 
 
 if __name__ == "__main__":

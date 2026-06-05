@@ -1,38 +1,48 @@
 # services/collector/app/consumers/trade_consumer.py
 
+from services.collector.app.consumers.base import BaseConsumer
 from services.collector.app.schemas.trade import TradeEvent
 
 from services.collector.app.consumers.trade_validator import (
     TradeValidator,
 )
+from shared.logging.config import get_logger
+from typing import Optional
+
+logger = get_logger(__name__)
 
 
-class TradeConsumer:
-    def consume(self, payload: dict) -> TradeEvent | None:
-
-        price_str = payload.get("p", "0")
-        quantity_str = payload.get("q", "0")
-
-        # Convert to float for comparison
+class TradeConsumer(BaseConsumer):
+    async def consume(self, payload: dict) -> Optional[TradeEvent]:
         try:
-            price = float(price_str)
-            quantity = float(quantity_str)
-        except (ValueError, TypeError):
-            return None  # Invalid format, skip
+            if payload.get("e") != "trade":
+                return None
 
-        # Skip zero-price or zero-quantity events to prevent crash on N/A execution types
-        if price <= 0 or quantity <= 0:
-            # print("non trade type payload", payload)
+            TradeValidator.validate(payload)
+
+            event_time = payload["E"]
+            symbol = payload["s"]
+            trade_id = payload["t"]
+            price = float(payload["p"])
+            quantity = float(payload["q"])
+            trade_time = payload["T"]
+            is_buyer_maker = payload["m"]
+
+            # Deterministic event_id
+            event_id = f"{symbol}_{trade_id}"
+
+            return TradeEvent(
+                event_id=event_id,
+                symbol=symbol,
+                exchange="binance",
+                event_time=event_time,
+                schema_version=1,
+                trade_id=trade_id,
+                trade_time=trade_time,
+                price=price,
+                quantity=quantity,
+                is_buyer_maker=is_buyer_maker,
+            )
+        except Exception as e:
+            logger.error(f"Failed to parse trade: {e}, payload={payload}")
             return None
-
-        TradeValidator.validate(payload)
-
-        return TradeEvent(
-            symbol=payload["s"],
-            trade_id=payload["t"],
-            event_time=payload["E"],
-            trade_time=payload["T"],
-            price=float(payload["p"]),
-            quantity=float(payload["q"]),
-            is_buyer_maker=payload["m"],
-        )

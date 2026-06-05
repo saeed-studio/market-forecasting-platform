@@ -1,140 +1,152 @@
 # services/collector/app/services/storage_consumer.py
 
 import asyncio
+from typing import Dict, List
+from collections import defaultdict
 
-from services.collector.app.queue.event_queue import (
-    EventQueue,
-)
+from shared.logging.config import get_logger
+from shared.schemas.base import BaseEvent
+from ..queue.event_queue import EventQueue
+from ..storage.writer import StorageWriter
+from ..storage.partitioner import Partitioner
+from ..checkpoint.store import CollectorCheckpointStore
 
-from services.collector.app.storage.batcher import (
-    EventBatcher,
-)
 
-from services.collector.app.storage.writer import (
-    StorageWriter,
-)
-
-from services.collector.app.storage.serializer import (
-    EventSerializer,
-)
+logger = get_logger(__name__)
 
 
 class StorageConsumer:
-    """
-    Consumes events from a queue, batches them, and writes them to storage.
-
-    The StorageConsumer acts as the bridge between the event queue and the
-    storage layer. It continuously pulls events from the queue, serializes them,
-    adds them to a batch, and flushes the batch to disk when either the batch
-    size threshold is reached or a time interval has passed.
-
-    The consumer runs two concurrent tasks:
-        1. Main event consumption loop (run method)
-        2. Periodic time-based flush loop (periodic_flush method)
-
-    This design ensures that events are written efficiently in batches rather
-    than individually, reducing I/O overhead while maintaining timely persistence.
-    """
-
     def __init__(
         self,
-        queue: EventQueue,
-        batcher: EventBatcher,
-        writer: StorageWriter,
-    ) -> None:
-        """
-        Initialize the StorageConsumer with queue, batcher, and writer.
+        event_queue: EventQueue,
+        base_path: str,
+        checkpoint_store: CollectorCheckpointStore,
+        batch_size: int = 1000,
+        flush_interval: float = 5.0,
+    ):
+        self._queue = event_queue
+        self._base_path = base_path
+        self._checkpoint_store = checkpoint_store
+        self._batch_size = batch_size
+        self._flush_interval = flush_interval
+        self._batch: List[BaseEvent] = []
+        self._running = True
+        self._checkpoint_cache: Dict[
+            str, int
+        ] = {}  # stream_key -> last checkpoint time
+        self._batch_lock = (
+            asyncio.Lock()
+        )  # protects batch and prevents concurrent flushes
+        self._writers: Dict[str, StorageWriter] = {}  # event_type -> StorageWriter
 
-        Args:
-            queue: EventQueue instance that provides async get() and task_done()
-                   methods for consuming events.
-            batcher: EventBatcher instance that accumulates events until a
-                     flush threshold is reached (size or time-based).
-            writer: StorageWriter instance that handles the actual writing of
-                    batched events to disk (e.g., Parquet files).
-        """
+    def _get_writer(self, event_type: str) -> StorageWriter:
+        """Get or create a StorageWriter for the given event_type."""
+        if event_type not in self._writers:
+            partitioner = Partitioner(base_path=self._base_path, stream_type=event_type)
+            self._writers[event_type] = StorageWriter(partitioner=partitioner)
+            logger.info(f"Created new storage writer for event_type={event_type}")
+        return self._writers[event_type]
 
-        self.queue = queue
+    async def run(self):
+        logger.info("StorageConsumer: consumption loop started")
+        flush_task = asyncio.create_task(self._flush_loop())
+        try:
+            while self._running:
+                event = await self._queue.get()
+                if await self._is_already_processed(event):
+                    logger.debug(
+                        f"Skipping old event: {event.stream_key} checkpoint={event.get_checkpoint_int()}"
+                    )
+                    self._queue.task_done()
+                    continue
 
-        self.batcher = batcher
+                # Append and check size inside lock
+                should_flush = False
+                async with self._batch_lock:
+                    self._batch.append(event)
+                    if len(self._batch) >= self._batch_size:
+                        should_flush = True
 
-        self.writer = writer
+                if should_flush:
+                    await self._flush()
 
-        self.running = True
+                self._queue.task_done()
+        finally:
+            flush_task.cancel()
+            await asyncio.gather(
+                flush_task,
+                return_exceptions=True,
+            )
 
-    async def run(self) -> None:
-        """
-        Main event consumption loop.
+    async def _flush_loop(self):
+        while self._running:
+            await asyncio.sleep(self._flush_interval)
+            # Quick check outside lock – fine for triggering
+            if self._batch:
+                await self._flush()
 
-        Continuously fetches events from the queue, serializes each event,
-        adds it to the batcher, and checks if a flush is needed based on
-        batch size. Runs until `self.running` is set to False.
+    async def _flush(self):
+        # Swap batch under lock
+        async with self._batch_lock:
+            if not self._batch:
+                return
+            batch_to_flush = self._batch
+            self._batch = []
+            per_stream_max: Dict[str, int] = defaultdict(int)
 
-        The method calls `queue.task_done()` after processing each event
-        to signal that the event has been successfully consumed and batched.
-        """
+        # Process the swapped batch outside the lock
+        # Process outside lock
+        try:
+            by_symbol_and_type: Dict[tuple, List[dict]] = defaultdict(list)
+            for event in batch_to_flush:
+                event_dict = event.__dict__
+                key = (event.symbol, event.event_type)
+                by_symbol_and_type[key].append(event_dict)
 
-        while self.running:
-            event = await self.queue.get()
+                sk = event.stream_key
+                cp_int = event.get_checkpoint_int()
+                if cp_int > per_stream_max[sk]:
+                    per_stream_max[sk] = cp_int
 
-            serialized = EventSerializer.serialize(event)
+            # Write to storage using the appropriate writer per event_type
+            for (symbol, event_type), events in by_symbol_and_type.items():
+                writer = self._get_writer(event_type)
+                writer.flush(symbol=symbol, events=events)
 
-            self.batcher.add(serialized)
+            # Batch update checkpoints
+            checkpoints_to_update = {
+                stream_key: str(max_cp) for stream_key, max_cp in per_stream_max.items()
+            }
+            if checkpoints_to_update:
+                await self._checkpoint_store.set_checkpoints_multi(
+                    checkpoints_to_update
+                )
+                for sk, cp in checkpoints_to_update.items():
+                    self._checkpoint_cache[sk] = int(cp)
 
-            if self.batcher.should_flush():
-                await self.flush()
+            logger.info(
+                f"Flushed {len(batch_to_flush)} events, checkpoints updated: {dict(per_stream_max)}"
+            )
+        except Exception as e:
+            logger.exception(f"Flush failed: {e}")
+            raise
 
-            self.queue.task_done()
+    async def _is_already_processed(self, event: BaseEvent) -> bool:
+        stream_key = event.stream_key
+        if stream_key not in self._checkpoint_cache:
+            cp_str = await self._checkpoint_store.get_checkpoint(stream_key)
+            if cp_str:
+                try:
+                    self._checkpoint_cache[stream_key] = int(cp_str)
+                except ValueError:
+                    logger.warning(
+                        f"Invalid checkpoint value {cp_str} for {stream_key}, resetting to 0"
+                    )
+                    self._checkpoint_cache[stream_key] = 0
+            else:
+                self._checkpoint_cache[stream_key] = 0
+        last_cp = self._checkpoint_cache[stream_key]
+        return event.get_checkpoint_int() <= last_cp
 
-    async def periodic_flush(
-        self,
-    ) -> None:
-        """
-        Periodic time-based flush loop.
-
-        Runs concurrently with the main consumption loop. Wakes up every
-        5 seconds and triggers a flush if there are events in the batch and
-        the time threshold has been exceeded.
-
-        This ensures that events are persisted even when batch size thresholds
-        are never reached (e.g., during low-traffic periods).
-        """
-
-        while self.running:
-            await asyncio.sleep(5)
-
-            if self.batcher.events and self.batcher.should_flush_by_time():
-                await self.flush()
-
-    async def flush(
-        self,
-    ) -> None:
-        """
-        Flush the current batch of events to storage.
-
-        Extracts the symbol from the first event in the batch (assuming all
-        events in a batch share the same symbol), calls the writer's flush
-        method with the symbol and events, then resets the batcher.
-
-        If there are no events in the batch, the method returns immediately
-        without performing any write operation.
-        """
-        if not self.batcher.events:
-            return
-
-        symbol = self.batcher.events[0]["symbol"]
-
-        self.writer.flush(
-            symbol=symbol,
-            events=self.batcher.events,
-        )
-
-        self.batcher.reset()
-
-    async def stop(self) -> None:
-
-        self.running = False
-
-        await self.flush()
-
-        self.writer.close()
+    async def stop(self):
+        self._running = False

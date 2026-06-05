@@ -2,9 +2,7 @@
 
 import asyncio
 from typing import Any
-
-from services.collector.app.queue.metrics import QueueMetrics
-from services.collector.app.queue.exceptions import QueueFullError
+from .metrics import QueueMetrics
 
 
 class EventQueue:
@@ -18,9 +16,10 @@ class EventQueue:
         self.metrics = QueueMetrics()
 
     async def put(self, item: Any) -> None:
-
-        if self._queue.full():
-            raise QueueFullError("Event queue is full.")
+        # No explicit full check – asyncio.Queue blocks automatically
+        # when using asyncio.Queue, it will block until space is available, so we don't need to raise an exception here.
+        # if self._queue.full():
+        #     raise QueueFullError("Event queue is full.")
 
         await self._queue.put(item)
 

@@ -1,13 +1,6 @@
 # services/collector/app/services/collector_service.py
 
-
-from services.collector.app.consumers.trade_consumer import (
-    TradeConsumer,
-)
-
-from services.collector.app.validation.pipeline import (
-    ValidationPipeline,
-)
+from services.collector.app.connection.manager import ConnectionManager
 
 from services.collector.app.queue.event_queue import (
     EventQueue,
@@ -17,25 +10,30 @@ from services.collector.app.queue.event_queue import (
 class CollectorService:
     def __init__(
         self,
+        *,
+        stream_url: str,
+        consumer,
         queue: EventQueue,
-    ) -> None:
+    ):
 
+        self.stream_url = stream_url
+        self.consumer = consumer
         self.queue = queue
 
-        self.consumer = TradeConsumer()
+        self.connection_manager = ConnectionManager(stream_url)
 
-        self.validator = ValidationPipeline()
-
-    async def process_message(
+    async def handle_message(
         self,
-        raw_message: str,
+        payload: dict,
     ) -> None:
 
-        payload = raw_message
+        event = self.consumer.consume(payload)
 
-        trade_event = self.consumer.consume(payload)
-
-        if trade_event is not None:
-            validated_event = self.validator.validate(trade_event)
-            await self.queue.put(validated_event)
+        if event is not None:
+            await self.queue.put(event)
         # If trade_event is None, nothing gets put in the queue (lost as desired)
+
+    async def run(self):
+
+        async for payload in self.connection_manager.listen():
+            await self.handle_message(payload)
